@@ -100,6 +100,16 @@ impl XrayCore {
         self.needs_xray && self.is_xray_started()
     }
 
+    pub fn core_kind(&mut self) -> Option<&'static str> {
+        if self.needs_sing_box && self.is_sing_box_started() {
+            Some("sing-box")
+        } else if self.needs_xray && self.is_xray_started() {
+            Some("xray")
+        } else {
+            None
+        }
+    }
+
     fn is_xray_started(&mut self) -> bool {
         is_child_started(&mut self.child)
     }
@@ -390,6 +400,7 @@ mod tests {
 
         assert!(sing_marker.exists());
         assert!(core.is_started());
+        assert_eq!(core.core_kind(), Some("sing-box"));
         core.stop();
     }
 
@@ -418,6 +429,7 @@ mod tests {
 
         assert!(xray_marker.exists());
         assert!(core.is_started());
+        assert_eq!(core.core_kind(), Some("xray"));
         core.stop();
     }
 
@@ -447,6 +459,31 @@ mod tests {
         assert!(sing_marker.exists());
         assert!(core.is_started());
         assert!(!core.xray_api_available());
+        assert_eq!(core.core_kind(), Some("sing-box"));
+        core.stop();
+    }
+
+    #[test]
+    fn exited_core_reports_no_current_core() {
+        let root = temp_root("exited-core");
+        let xray = root.join("xray");
+        write_executable(
+            &xray,
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'Xray 26.6.27'; exit 0; fi\nexit 0\n",
+        );
+
+        let config = XrayConfig::from_controller_json(
+            r#"{"inbounds":[{"tag":"VLESS","protocol":"vless","port":443}]}"#,
+            &api_settings(),
+        )
+        .unwrap();
+        let mut core = XrayCore::new(settings(&root, xray, root.join("missing-sing-box"))).unwrap();
+
+        core.start(&config).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(!core.is_started());
+        assert_eq!(core.core_kind(), None);
         core.stop();
     }
 }

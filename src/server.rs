@@ -318,8 +318,9 @@ fn response_from_state(state: &mut State, extra: Option<Value>) -> HttpResponse 
         "connected": state.connected,
         "started": started,
         "xray_api": xray_api,
+        "core_kind": state.core.core_kind(),
         "core_version": state.core.version(),
-        "features": ["controller_inbounds"],
+        "features": ["controller_inbounds", "core_kind"],
     });
     if let Some(extra) = extra {
         merge_json(&mut body, extra);
@@ -779,5 +780,7 @@ mod tests {
         let response = response_from_state(&mut state, None);
 
         assert_eq!(response.body["xray_api"], false);
+        assert!(response.body.as_object().unwrap().contains_key("core_kind"));
+        assert_eq!(response.body["core_kind"], Value::Null);
     }
 }
