@@ -1,17 +1,30 @@
 use crate::config::Settings;
-use crate::xray_config::XrayConfig;
-use std::collections::VecDeque;
+use crate::xray_config::{ConfiguredInboundPort, XrayConfig};
+use serde::Serialize;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LOG_BUFFER_LIMIT: usize = 100;
+const CORE_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
+const CORE_INSTALL_CACHE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CoreInstallInfo {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub path: Option<String>,
+    pub source: String,
+}
 
 #[derive(Debug)]
 pub enum CoreError {
     Io(std::io::Error),
     VersionNotFound(&'static str),
+    VersionTimeout(&'static str),
     AlreadyStarted,
     NoCoreRequired,
     StdinUnavailable,
@@ -22,6 +35,7 @@ impl std::fmt::Display for CoreError {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::VersionNotFound(core) => write!(f, "Failed to detect {core} version"),
+            Self::VersionTimeout(core) => write!(f, "{core} version detection timed out"),
             Self::AlreadyStarted => write!(f, "Core is started already"),
             Self::NoCoreRequired => write!(f, "No core is required for the selected inbounds"),
             Self::StdinUnavailable => write!(f, "Core stdin is unavailable"),
@@ -45,6 +59,9 @@ pub struct XrayCore {
     sing_box_child: Option<Child>,
     needs_xray: bool,
     needs_sing_box: bool,
+    configured_inbound_ports: Vec<ConfiguredInboundPort>,
+    last_core_restart_at: Option<u64>,
+    installed_cores_cache: Mutex<Option<(Instant, BTreeMap<String, CoreInstallInfo>)>>,
     logs: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -57,6 +74,9 @@ impl XrayCore {
             sing_box_child: None,
             needs_xray: false,
             needs_sing_box: false,
+            configured_inbound_ports: Vec::new(),
+            last_core_restart_at: None,
+            installed_cores_cache: Mutex::new(None),
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_BUFFER_LIMIT))),
         })
     }
@@ -108,6 +128,80 @@ impl XrayCore {
         } else {
             None
         }
+    }
+
+    pub fn installed_cores(&self) -> BTreeMap<String, CoreInstallInfo> {
+        if let Ok(cache) = self.installed_cores_cache.lock() {
+            if let Some((checked_at, installed_cores)) = cache.as_ref() {
+                if checked_at.elapsed() < CORE_INSTALL_CACHE_TTL {
+                    return installed_cores.clone();
+                }
+            }
+        }
+
+        let xray_settings = self.settings.clone();
+        let sing_box_settings = self.settings.clone();
+        let xray_handle = thread::spawn(move || {
+            core_install_info(
+                "xray",
+                &xray_settings.xray_executable_path,
+                detect_xray_version(&xray_settings),
+            )
+        });
+        let sing_box_handle = thread::spawn(move || {
+            core_install_info(
+                "sing-box",
+                &sing_box_settings.sing_box_executable_path,
+                detect_sing_box_version(&sing_box_settings),
+            )
+        });
+
+        let installed_cores = BTreeMap::from([
+            (
+                "sing-box".to_owned(),
+                sing_box_handle.join().unwrap_or_else(|_| {
+                    missing_core_info("sing-box", &self.settings.sing_box_executable_path)
+                }),
+            ),
+            (
+                "xray".to_owned(),
+                xray_handle.join().unwrap_or_else(|_| {
+                    missing_core_info("xray", &self.settings.xray_executable_path)
+                }),
+            ),
+        ]);
+
+        if let Ok(mut cache) = self.installed_cores_cache.lock() {
+            *cache = Some((Instant::now(), installed_cores.clone()));
+        }
+
+        installed_cores
+    }
+
+    pub fn configured_inbound_ports(&self) -> &[ConfiguredInboundPort] {
+        &self.configured_inbound_ports
+    }
+
+    pub fn last_core_restart_at(&self) -> Option<u64> {
+        self.last_core_restart_at
+    }
+
+    pub fn core_rss_bytes(&self) -> Option<u64> {
+        let mut total = 0u64;
+        let mut found = false;
+        if let Some(child) = self.child.as_ref() {
+            if let Some(rss) = process_rss_bytes(child.id()) {
+                total += rss;
+                found = true;
+            }
+        }
+        if let Some(child) = self.sing_box_child.as_ref() {
+            if let Some(rss) = process_rss_bytes(child.id()) {
+                total += rss;
+                found = true;
+            }
+        }
+        found.then_some(total)
     }
 
     fn is_xray_started(&mut self) -> bool {
@@ -171,6 +265,8 @@ impl XrayCore {
         }
 
         self.version = versions.join(", ");
+        self.configured_inbound_ports = config.configured_inbound_ports();
+        self.last_core_restart_at = unix_timestamp();
         Ok(())
     }
 
@@ -188,6 +284,7 @@ impl XrayCore {
         self.needs_xray = false;
         self.needs_sing_box = false;
         self.version = "unknown".to_owned();
+        self.configured_inbound_ports.clear();
     }
 
     pub fn restart(&mut self, config: &XrayConfig) -> Result<(), CoreError> {
@@ -205,6 +302,54 @@ impl XrayCore {
     fn push_log(&self, line: String) {
         push_log(&self.logs, line);
     }
+}
+
+pub fn agent_rss_bytes() -> Option<u64> {
+    process_rss_bytes(std::process::id())
+}
+
+fn core_install_info(
+    name: &str,
+    path: &std::path::Path,
+    version: Result<String, CoreError>,
+) -> CoreInstallInfo {
+    match version {
+        Ok(version) => CoreInstallInfo {
+            installed: true,
+            version: Some(version),
+            path: Some(path.to_string_lossy().into_owned()),
+            source: "configured_path".to_owned(),
+        },
+        Err(_) => CoreInstallInfo {
+            ..missing_core_info(name, path)
+        },
+    }
+}
+
+fn missing_core_info(name: &str, path: &std::path::Path) -> CoreInstallInfo {
+    CoreInstallInfo {
+        installed: false,
+        version: None,
+        path: Some(path.to_string_lossy().into_owned()),
+        source: format!("configured_path:{name}"),
+    }
+}
+
+fn unix_timestamp() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn process_rss_bytes(pid: u32) -> Option<u64> {
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let rss_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some(rss_pages * page_size_bytes())
+}
+
+fn page_size_bytes() -> u64 {
+    4096
 }
 
 impl Drop for XrayCore {
@@ -260,9 +405,12 @@ fn spawn_with_stdin(
 }
 
 fn detect_xray_version(settings: &Settings) -> Result<String, CoreError> {
-    let output = Command::new(&settings.xray_executable_path)
-        .arg("version")
-        .output()?;
+    let output = command_output_with_timeout(
+        &settings.xray_executable_path,
+        &["version"],
+        CORE_VERSION_TIMEOUT,
+        "Xray",
+    )?;
     let text = String::from_utf8_lossy(&output.stdout);
     let version = text
         .lines()
@@ -273,9 +421,12 @@ fn detect_xray_version(settings: &Settings) -> Result<String, CoreError> {
 }
 
 fn detect_sing_box_version(settings: &Settings) -> Result<String, CoreError> {
-    let output = Command::new(&settings.sing_box_executable_path)
-        .arg("version")
-        .output()?;
+    let output = command_output_with_timeout(
+        &settings.sing_box_executable_path,
+        &["version"],
+        CORE_VERSION_TIMEOUT,
+        "sing-box",
+    )?;
     let text = String::from_utf8_lossy(&output.stdout);
     let version = text
         .lines()
@@ -286,6 +437,31 @@ fn detect_sing_box_version(settings: &Settings) -> Result<String, CoreError> {
         .and_then(|rest| rest.split_whitespace().next())
         .ok_or(CoreError::VersionNotFound("sing-box"))?;
     Ok(version.to_owned())
+}
+
+fn command_output_with_timeout(
+    executable: &std::path::Path,
+    args: &[&str],
+    timeout: Duration,
+    core_name: &'static str,
+) -> Result<std::process::Output, CoreError> {
+    let mut child = Command::new(executable)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(CoreError::Io);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CoreError::VersionTimeout(core_name));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn spawn_log_reader<R>(reader: R, logs: Arc<Mutex<VecDeque<String>>>)
@@ -316,7 +492,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn api_settings() -> ApiSettings {
         ApiSettings {
@@ -376,6 +552,73 @@ mod tests {
     }
 
     #[test]
+    fn installed_cores_report_configured_binary_versions() {
+        let root = temp_root("installed-cores");
+        let xray = root.join("xray");
+        let sing_box = root.join("sing-box");
+        write_executable(
+            &xray,
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'Xray 26.6.27'; exit 0; fi\nexit 0\n",
+        );
+        write_executable(
+            &sing_box,
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 'sing-box version 1.13.0'; exit 0; fi\nexit 0\n",
+        );
+        let core = XrayCore::new(settings(&root, xray.clone(), sing_box.clone())).unwrap();
+
+        let installed = core.installed_cores();
+
+        assert_eq!(installed["xray"].installed, true);
+        assert_eq!(installed["xray"].version.as_deref(), Some("26.6.27"));
+        assert_eq!(
+            installed["xray"].path.as_deref(),
+            Some(xray.to_str().unwrap())
+        );
+        assert_eq!(installed["sing-box"].installed, true);
+        assert_eq!(installed["sing-box"].version.as_deref(), Some("1.13.0"));
+        assert_eq!(
+            installed["sing-box"].path.as_deref(),
+            Some(sing_box.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn installed_cores_report_missing_binaries() {
+        let root = temp_root("missing-cores");
+        let core = XrayCore::new(settings(
+            &root,
+            root.join("missing-xray"),
+            root.join("missing-sing-box"),
+        ))
+        .unwrap();
+
+        let installed = core.installed_cores();
+
+        assert_eq!(installed["xray"].installed, false);
+        assert_eq!(installed["xray"].version, None);
+        assert_eq!(installed["sing-box"].installed, false);
+        assert_eq!(installed["sing-box"].version, None);
+    }
+
+    #[test]
+    fn installed_core_detection_times_out_slow_version_command() {
+        let root = temp_root("slow-version");
+        let xray = root.join("xray");
+        write_executable(
+            &xray,
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then sleep 5; echo 'Xray 26.6.27'; exit 0; fi\nexit 0\n",
+        );
+        let core = XrayCore::new(settings(&root, xray, root.join("missing-sing-box"))).unwrap();
+
+        let started = Instant::now();
+        let installed = core.installed_cores();
+
+        assert!(started.elapsed() < Duration::from_millis(4500));
+        assert_eq!(installed["xray"].installed, false);
+        assert_eq!(installed["xray"].version, None);
+    }
+
+    #[test]
     fn hysteria2_only_starts_sing_box_without_xray() {
         let root = temp_root("hy2-only");
         let sing_box = root.join("sing-box");
@@ -401,6 +644,9 @@ mod tests {
         assert!(sing_marker.exists());
         assert!(core.is_started());
         assert_eq!(core.core_kind(), Some("sing-box"));
+        assert!(core.last_core_restart_at().is_some());
+        assert_eq!(core.configured_inbound_ports()[0].tag, "HY2");
+        assert_eq!(core.configured_inbound_ports()[0].port, 8443);
         core.stop();
     }
 

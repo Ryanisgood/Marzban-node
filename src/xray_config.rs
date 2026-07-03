@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fmt;
@@ -40,6 +41,16 @@ pub struct ApiSettings {
 pub enum CoreKind {
     Xray,
     SingBox,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConfiguredInboundPort {
+    pub tag: String,
+    pub protocol: String,
+    pub network: String,
+    pub transport: String,
+    pub listen: String,
+    pub port: u16,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -94,6 +105,79 @@ impl XrayConfig {
     pub fn core_kind(&self) -> Option<CoreKind> {
         self.core_kind
     }
+
+    pub fn configured_inbound_ports(&self) -> Vec<ConfiguredInboundPort> {
+        let inbounds = self
+            .sing_box_value
+            .as_ref()
+            .or(Some(&self.value))
+            .and_then(|value| value.get("inbounds"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        inbounds
+            .iter()
+            .filter_map(configured_inbound_port)
+            .collect()
+    }
+}
+
+fn configured_inbound_port(inbound: &Value) -> Option<ConfiguredInboundPort> {
+    let tag = inbound.get("tag").and_then(Value::as_str)?.to_owned();
+    if tag == "API_INBOUND" {
+        return None;
+    }
+
+    let protocol = inbound
+        .get("protocol")
+        .or_else(|| inbound.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let port = inbound
+        .get("port")
+        .or_else(|| inbound.get("listen_port"))
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())?;
+    let listen = inbound
+        .get("listen")
+        .and_then(Value::as_str)
+        .unwrap_or("0.0.0.0")
+        .to_owned();
+    let network = inbound_network(inbound, &protocol);
+    let transport = if matches!(network.as_str(), "hysteria" | "udp" | "quic" | "kcp")
+        || protocol == "hysteria2"
+    {
+        "udp"
+    } else {
+        "tcp"
+    };
+
+    Some(ConfiguredInboundPort {
+        tag,
+        protocol,
+        network,
+        transport: transport.to_owned(),
+        listen,
+        port,
+    })
+}
+
+fn inbound_network(inbound: &Value, protocol: &str) -> String {
+    inbound
+        .get("streamSettings")
+        .and_then(|settings| settings.get("network"))
+        .or_else(|| inbound.get("network"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if protocol == "hysteria2" {
+                "hysteria".to_owned()
+            } else {
+                "tcp".to_owned()
+            }
+        })
 }
 
 struct AppliedConfig {

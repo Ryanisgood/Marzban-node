@@ -1,6 +1,6 @@
 use crate::config::Settings;
-use crate::core::XrayCore;
-use crate::xray_config::{ApiSettings, XrayConfig};
+use crate::core::{agent_rss_bytes, XrayCore};
+use crate::xray_config::{ApiSettings, ConfiguredInboundPort, XrayConfig};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use rustls::client::danger::HandshakeSignatureValid;
@@ -13,6 +13,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -314,18 +315,77 @@ fn api_settings(
 fn response_from_state(state: &mut State, extra: Option<Value>) -> HttpResponse {
     let started = state.core.is_started();
     let xray_api = state.core.xray_api_available();
+    let configured_inbound_ports = state.core.configured_inbound_ports().to_vec();
+    let local_listening_ports = local_listening_ports(&configured_inbound_ports);
     let mut body = json!({
         "connected": state.connected,
         "started": started,
         "xray_api": xray_api,
         "core_kind": state.core.core_kind(),
         "core_version": state.core.version(),
-        "features": ["controller_inbounds", "core_kind"],
+        "node_version": env!("CARGO_PKG_VERSION"),
+        "installed_cores": state.core.installed_cores(),
+        "memory": {
+            "agent_rss_bytes": agent_rss_bytes(),
+            "core_rss_bytes": state.core.core_rss_bytes(),
+        },
+        "local_listening_ports": local_listening_ports,
+        "configured_inbound_ports": configured_inbound_ports,
+        "last_core_restart_at": state.core.last_core_restart_at(),
+        "features": ["controller_inbounds", "core_kind", "node_diagnostics"],
     });
     if let Some(extra) = extra {
         merge_json(&mut body, extra);
     }
     HttpResponse::json(200, body)
+}
+
+fn local_listening_ports(configured_ports: &[ConfiguredInboundPort]) -> Vec<Value> {
+    let mut sockets = BTreeSet::new();
+    collect_proc_net("/proc/net/tcp", "tcp", &mut sockets);
+    collect_proc_net("/proc/net/tcp6", "tcp", &mut sockets);
+    collect_proc_net("/proc/net/udp", "udp", &mut sockets);
+    collect_proc_net("/proc/net/udp6", "udp", &mut sockets);
+    configured_ports
+        .iter()
+        .filter(|configured| sockets.contains(&(configured.transport.as_str(), configured.port)))
+        .map(|configured| {
+            json!({
+                "tag": configured.tag,
+                "transport": configured.transport,
+                "port": configured.port
+            })
+        })
+        .collect()
+}
+
+fn collect_proc_net(
+    path: &str,
+    transport: &'static str,
+    sockets: &mut BTreeSet<(&'static str, u16)>,
+) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in content.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let _sl = fields.next();
+        let Some(local_address) = fields.next() else {
+            continue;
+        };
+        let Some(state) = fields.next() else {
+            continue;
+        };
+        if transport == "tcp" && state != "0A" {
+            continue;
+        }
+        let Some(port_hex) = local_address.rsplit(':').next() else {
+            continue;
+        };
+        if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+            sockets.insert((transport, port));
+        }
+    }
 }
 
 fn merge_json(base: &mut Value, extra: Value) {
@@ -782,5 +842,59 @@ mod tests {
         assert_eq!(response.body["xray_api"], false);
         assert!(response.body.as_object().unwrap().contains_key("core_kind"));
         assert_eq!(response.body["core_kind"], Value::Null);
+    }
+
+    #[test]
+    fn state_response_reports_node_diagnostics() {
+        let settings = Settings {
+            service_host: "127.0.0.1".to_owned(),
+            service_port: 62050,
+            xray_api_host: "127.0.0.1".to_owned(),
+            xray_api_port: 62051,
+            xray_executable_path: "missing-xray".into(),
+            xray_assets_path: "missing-assets".into(),
+            sing_box_executable_path: "missing-sing-box".into(),
+            ssl_cert_file: "cert.pem".into(),
+            ssl_key_file: "key.pem".into(),
+            ssl_client_cert_file: None,
+            debug: false,
+            inbounds: vec![],
+        };
+        let mut state = State {
+            connected: true,
+            client_ip: Some("127.0.0.1".to_owned()),
+            session_id: None,
+            core: XrayCore::new(settings).unwrap(),
+        };
+
+        let response = response_from_state(&mut state, None);
+
+        assert_eq!(response.body["node_version"], env!("CARGO_PKG_VERSION"));
+        assert!(response.body["installed_cores"]["xray"]["installed"].is_boolean());
+        assert!(response.body["installed_cores"]["sing-box"]["installed"].is_boolean());
+        assert!(
+            response.body["memory"]["agent_rss_bytes"].is_number()
+                || response.body["memory"]["agent_rss_bytes"].is_null()
+        );
+        assert!(
+            response.body["memory"]["core_rss_bytes"].is_number()
+                || response.body["memory"]["core_rss_bytes"].is_null()
+        );
+        assert!(response.body["local_listening_ports"].is_array());
+        assert!(response.body["local_listening_ports"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(response.body["configured_inbound_ports"].is_array());
+        assert!(response
+            .body
+            .as_object()
+            .unwrap()
+            .contains_key("last_core_restart_at"));
+        assert!(response.body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|feature| feature == "node_diagnostics"));
     }
 }
