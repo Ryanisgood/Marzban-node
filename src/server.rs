@@ -68,6 +68,7 @@ struct SessionBody {
     session_id: Uuid,
     #[serde(default)]
     config: String,
+    inbounds: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -195,7 +196,7 @@ fn handle_rest(
             if let Err(response) = match_session(&state, body.session_id) {
                 return response;
             }
-            let api = match api_settings(&state, &settings) {
+            let api = match api_settings(&state, &settings, body.inbounds.as_ref()) {
                 Ok(api) => api,
                 Err(response) => return response,
             };
@@ -234,7 +235,7 @@ fn handle_rest(
             if let Err(response) = match_session(&state, body.session_id) {
                 return response;
             }
-            let api = match api_settings(&state, &settings) {
+            let api = match api_settings(&state, &settings, body.inbounds.as_ref()) {
                 Ok(api) => api,
                 Err(response) => return response,
             };
@@ -289,6 +290,7 @@ fn match_session(state: &Arc<Mutex<State>>, session_id: Uuid) -> Result<(), Http
 fn api_settings(
     state: &Arc<Mutex<State>>,
     settings: &Settings,
+    controller_inbounds: Option<&Vec<String>>,
 ) -> Result<ApiSettings, HttpResponse> {
     let state = state
         .lock()
@@ -303,7 +305,9 @@ fn api_settings(
         ssl_cert_file: settings.ssl_cert_file.to_string_lossy().into_owned(),
         ssl_key_file: settings.ssl_key_file.to_string_lossy().into_owned(),
         peer_ip,
-        allowed_inbounds: settings.inbounds.clone(),
+        allowed_inbounds: controller_inbounds
+            .cloned()
+            .unwrap_or_else(|| settings.inbounds.clone()),
     })
 }
 
@@ -315,6 +319,7 @@ fn response_from_state(state: &mut State, extra: Option<Value>) -> HttpResponse 
         "started": started,
         "xray_api": xray_api,
         "core_version": state.core.version(),
+        "features": ["controller_inbounds"],
     });
     if let Some(extra) = extra {
         merge_json(&mut body, extra);
@@ -698,6 +703,54 @@ mod tests {
             Some("abc".to_owned())
         );
         assert_eq!(query_param("/logs", "session_id"), None);
+    }
+
+    #[test]
+    fn session_body_accepts_controller_selected_inbounds() {
+        let request = Request {
+            method: "POST".to_owned(),
+            path: "/restart".to_owned(),
+            headers: vec![],
+            body: br#"{"session_id":"42d7485e-de58-4360-870c-9fb9906e713e","config":"{}","inbounds":["VLESS"]}"#.to_vec(),
+        };
+
+        let body = match parse_session_body(&request) {
+            Ok(body) => body,
+            Err(response) => panic!("unexpected error response: {}", response.status),
+        };
+
+        assert_eq!(body.inbounds, Some(vec!["VLESS".to_owned()]));
+    }
+
+    #[test]
+    fn controller_selected_inbounds_override_env_inbounds() {
+        let settings = Settings {
+            service_host: "127.0.0.1".to_owned(),
+            service_port: 62050,
+            xray_api_host: "127.0.0.1".to_owned(),
+            xray_api_port: 62051,
+            xray_executable_path: "missing-xray".into(),
+            xray_assets_path: "missing-assets".into(),
+            sing_box_executable_path: "missing-sing-box".into(),
+            ssl_cert_file: "cert.pem".into(),
+            ssl_key_file: "key.pem".into(),
+            ssl_client_cert_file: None,
+            debug: false,
+            inbounds: vec!["HY2".to_owned()],
+        };
+        let state = Arc::new(Mutex::new(State {
+            connected: true,
+            client_ip: Some("127.0.0.1".to_owned()),
+            session_id: None,
+            core: XrayCore::new(settings.clone()).unwrap(),
+        }));
+
+        let api = match api_settings(&state, &settings, Some(&vec!["VLESS".to_owned()])) {
+            Ok(api) => api,
+            Err(response) => panic!("unexpected error response: {}", response.status),
+        };
+
+        assert_eq!(api.allowed_inbounds, vec!["VLESS".to_owned()]);
     }
 
     #[test]
