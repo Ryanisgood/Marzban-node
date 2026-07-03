@@ -1,12 +1,12 @@
 [Unit]
-Description=Marzban Node Service
+Description=Marzban Node Rust Service
 Documentation=https://github.com/gozargah/Marzban-node
 After=network.target nss-lookup.target
 
 [Service]
-ExecStart=/usr/bin/env python3 /var/lib/marzban-node/main.py
+ExecStart=/usr/local/bin/marzban-node
 Restart=on-failure
-WorkingDirectory=/var/lib/marzban-node
+EnvironmentFile=-/etc/marzban-node.env
 
 [Install]
 WantedBy=multi-user.target
