@@ -101,6 +101,14 @@ The REST API is protected with mTLS. Do not print or paste private key contents 
 
 ## Systemd Deployment
 
+For MarzbanX Add Node installs, prefer the controller-generated command. It writes this env file, installs the service, starts the node, and finalizes the one-time token:
+
+```bash
+curl -fsSL https://controller.example.com/api/node/install.sh | sudo bash -s -- --token xxx
+```
+
+In this mode, do not set `INBOUNDS`. The controller owns the node's inbound selection and pushes active inbound tags at runtime.
+
 Create `/etc/marzban-node.env`:
 
 ```env
@@ -114,10 +122,15 @@ SING_BOX_EXECUTABLE_PATH=/usr/local/bin/sing-box
 SSL_CERT_FILE=/var/lib/marzban-node/ssl_cert.pem
 SSL_KEY_FILE=/var/lib/marzban-node/ssl_key.pem
 SSL_CLIENT_CERT_FILE=/var/lib/marzban-node/cert.pem
+```
+
+For legacy/manual nodes, `INBOUNDS` is still available:
+
+```env
 INBOUNDS="Shadowsocks TCP,hy2-rn1c1g"
 ```
 
-Quote `INBOUNDS` when an inbound tag contains spaces, for example `Shadowsocks TCP`.
+Quote `INBOUNDS` when an inbound tag contains spaces, for example `Shadowsocks TCP`. Do not use this legacy variable to bypass MarzbanX node ownership; panel-managed nodes should receive owned inbound tags from the controller.
 
 Install and start:
 
@@ -180,13 +193,15 @@ If it is not quoted, the wrapper may log:
 
 ## Controller Configuration Checklist
 
-For each node:
+For MarzbanX panel-managed nodes, use Add Node in the controller. It creates the node row, owned inbound rows, hosts, install token, and controller-managed active inbound selection.
+
+For manual/legacy nodes only:
 
 1. Add or update the node row with:
    - `address`
    - `port=62050`
    - `api_port=62051`
-2. Add `inbounds` rows for every selected inbound tag.
+2. Add `inbounds` rows for every selected inbound tag. For panel-managed ownership migration, set `owner_node_id` only for inbounds truly dedicated to that node.
 3. Add `hosts` rows for user-facing subscription addresses.
 4. Make sure `/var/lib/marzban/xray_config.json` contains the matching inbound tag.
 5. Restart Marzban so runtime config reloads.
@@ -270,6 +285,7 @@ sudo docker exec -e PYTHONPATH=/code marzban-marzban-1 python -c 'from app impor
 - **Do not copy a glibc binary blindly.** The RN3C4G binary required glibc 2.39 and failed on RN1C1G with glibc 2.36. Use the musl static build for portable deployment.
 - **Old TLS certs may fail Rust TLS.** RN1C1G's old cert failed with `UnsupportedCertVersion`. Copying or generating v3-compatible node TLS certs fixed the Rust node startup.
 - **Quote inbound tags with spaces.** `Shadowsocks TCP` must be quoted in env files loaded by a shell and is safer quoted in systemd env files too.
+- **Panel-managed MarzbanX nodes should not use `INBOUNDS`.** The controller now owns active inbound selection. `INBOUNDS` is for legacy/manual nodes.
 - **HY2 requires raw config plus DB rows.** `hy2-rn1c1g` initially existed only in intent, not in runtime/raw config, so the node did not receive the HY2 inbound needed to select sing-box.
 - **One core per node config.** HY2 plus VLESS, Shadowsocks, or Trojan runs on one sing-box process. If `INBOUNDS` selects HY2 plus a protocol whose sing-box translator is not implemented yet, the node rejects the config until that translator is added.
 - **Manual REST `/start` can isolate failures.** If an Xray-selected config starts but Marzban marks the node error, check `62051` gRPC reachability and Xray API startup. HY2/sing-box configs should return `xray_api=false` and skip that gRPC check.

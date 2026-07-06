@@ -75,11 +75,15 @@ SSL_CLIENT_CERT_FILE=/var/lib/marzban-node/ssl_client_cert.pem
 
 For panel-managed nodes created by MarzbanX provisioning, do not set `INBOUNDS`. The controller sends active inbound tags to the node.
 
-For legacy/manual nodes, `INBOUNDS` is still available:
+MarzbanX panel-managed nodes now use node-owned inbounds on the controller. That means a node should only run inbound tags owned by that same node, and the controller enforces that before pushing config. The node binary simply runs the active tags it receives from the controller; it does not decide ownership locally.
+
+For legacy/manual nodes only, `INBOUNDS` is still available:
 
 ```env
 INBOUNDS=hy2-rn1c1g,Shadowsocks TCP,VLESS TCP REALITY
 ```
+
+Do not use `INBOUNDS` to make one MarzbanX panel-managed node run another node's inbound. Create or assign a node-owned inbound in the controller instead.
 
 The unused core does not need to exist on disk. A HY2 or AnyTLS node needs `sing-box`; a pure Xray-compatible node needs `xray`.
 
