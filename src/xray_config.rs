@@ -350,7 +350,7 @@ fn select_core(inbounds: &[Value]) -> Option<CoreKind> {
 }
 
 fn requires_sing_box(inbound: &Value) -> bool {
-    is_hysteria2_inbound(inbound)
+    is_hysteria2_inbound(inbound) || is_anytls_inbound(inbound)
 }
 
 fn build_sing_box_config(inbounds: &[Value], api: &ApiSettings) -> Result<Value, ConfigError> {
@@ -359,6 +359,10 @@ fn build_sing_box_config(inbounds: &[Value], api: &ApiSettings) -> Result<Value,
     for inbound in inbounds {
         if is_hysteria2_inbound(inbound) {
             sing_box_inbounds.push(sing_box_hysteria2_inbound(inbound, api));
+            continue;
+        }
+        if is_anytls_inbound(inbound) {
+            sing_box_inbounds.push(sing_box_anytls_inbound(inbound, api));
             continue;
         }
 
@@ -407,6 +411,10 @@ fn is_hysteria2_inbound(inbound: &Value) -> bool {
             .and_then(|settings| settings.get("network"))
             .and_then(Value::as_str)
             == Some("hysteria")
+}
+
+fn is_anytls_inbound(inbound: &Value) -> bool {
+    inbound.get("protocol").and_then(Value::as_str) == Some("anytls")
 }
 
 fn sing_box_hysteria2_inbound(inbound: &Value, api: &ApiSettings) -> Value {
@@ -477,6 +485,34 @@ fn sing_box_hysteria2_inbound(inbound: &Value, api: &ApiSettings) -> Value {
         "users": users,
         "tls": tls
     })
+}
+
+fn sing_box_anytls_inbound(inbound: &Value, api: &ApiSettings) -> Value {
+    let settings = inbound.get("settings").unwrap_or(&Value::Null);
+    let users: Vec<Value> = settings
+        .get("users")
+        .or_else(|| settings.get("clients"))
+        .and_then(Value::as_array)
+        .map(|users| {
+            users
+                .iter()
+                .filter_map(|user| {
+                    let password = user.get("password").and_then(Value::as_str)?;
+                    Some(json!({
+                        "name": user_name(user, password),
+                        "password": password
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut value = sing_box_inbound_base(inbound, "anytls");
+    value["users"] = json!(users);
+    let mut tls = sing_box_tls(inbound).unwrap_or_else(|| json!({ "enabled": true }));
+    ensure_tls_certificate_paths(&mut tls, api);
+    value["tls"] = tls;
+    value
 }
 
 fn sing_box_vless_inbound(inbound: &Value) -> Value {
@@ -688,6 +724,17 @@ fn apply_certificate_settings(tls: &mut Value, tls_settings: &Value) {
         } else if let Some(lines) = certificate.get("key").and_then(Value::as_array) {
             tls["key"] = json!(lines_to_pem(lines));
         }
+    }
+}
+
+fn ensure_tls_certificate_paths(tls: &mut Value, api: &ApiSettings) {
+    let has_certificate = tls.get("certificate_path").is_some() || tls.get("certificate").is_some();
+    let has_key = tls.get("key_path").is_some() || tls.get("key").is_some();
+    if !has_certificate {
+        tls["certificate_path"] = json!(api.ssl_cert_file);
+    }
+    if !has_key {
+        tls["key_path"] = json!(api.ssl_key_file);
     }
 }
 
@@ -919,6 +966,57 @@ mod tests {
     }
 
     #[test]
+    fn anytls_only_config_requires_only_sing_box() {
+        let config = XrayConfig::from_controller_json(
+            r#"{
+                "inbounds": [
+                    {
+                        "tag": "AnyTLS",
+                        "listen": "0.0.0.0",
+                        "port": 9443,
+                        "protocol": "anytls",
+                        "settings": {
+                            "users": [
+                                {"email": "1.alice", "password": "alice-secret"}
+                            ]
+                        },
+                        "streamSettings": {
+                            "network": "tcp",
+                            "security": "tls",
+                            "tlsSettings": {
+                                "serverName": "any.example.com",
+                                "alpn": ["h2", "http/1.1"],
+                                "certificates": [
+                                    {
+                                        "certificateFile": "/etc/anytls.crt",
+                                        "keyFile": "/etc/anytls.key"
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ]
+            }"#,
+            &api_settings(),
+        )
+        .unwrap();
+
+        assert!(!config.needs_xray());
+        assert!(config.needs_sing_box());
+        let sing_box = config.sing_box_value().unwrap();
+        let anytls = &sing_box["inbounds"][0];
+        assert_eq!(anytls["type"], "anytls");
+        assert_eq!(anytls["tag"], "AnyTLS");
+        assert_eq!(anytls["listen_port"], 9443);
+        assert_eq!(anytls["users"][0]["name"], "1.alice");
+        assert_eq!(anytls["users"][0]["password"], "alice-secret");
+        assert_eq!(anytls["tls"]["enabled"], true);
+        assert_eq!(anytls["tls"]["server_name"], "any.example.com");
+        assert_eq!(anytls["tls"]["certificate_path"], "/etc/anytls.crt");
+        assert_eq!(anytls["tls"]["key_path"], "/etc/anytls.key");
+    }
+
+    #[test]
     fn xray_only_config_requires_only_xray() {
         let config = XrayConfig::from_controller_json(
             r#"{"inbounds":[{"tag":"VLESS","protocol":"vless","port":443}]}"#,
@@ -967,6 +1065,18 @@ mod tests {
                         "protocol": "hysteria",
                         "settings": {"version": 2, "users": [{"email": "1.hy2", "auth": "hy2-secret"}]},
                         "streamSettings": {"network": "hysteria"}
+                    },
+                    {
+                        "tag": "AnyTLS",
+                        "listen": "0.0.0.0",
+                        "port": 9443,
+                        "protocol": "anytls",
+                        "settings": {"users": [{"email": "5.anytls", "password": "anytls-secret"}]},
+                        "streamSettings": {
+                            "network": "tcp",
+                            "security": "tls",
+                            "tlsSettings": {"serverName": "any.example.com"}
+                        }
                     },
                     {
                         "tag": "VLESS",
@@ -1027,11 +1137,17 @@ mod tests {
 
         let sing_box = config.sing_box_value().unwrap();
         let inbounds = sing_box["inbounds"].as_array().unwrap();
-        assert_eq!(inbounds.len(), 4);
+        assert_eq!(inbounds.len(), 5);
 
         assert_eq!(inbounds[0]["type"], "hysteria2");
 
-        let vless = &inbounds[1];
+        let anytls = &inbounds[1];
+        assert_eq!(anytls["type"], "anytls");
+        assert_eq!(anytls["users"][0]["name"], "5.anytls");
+        assert_eq!(anytls["users"][0]["password"], "anytls-secret");
+        assert_eq!(anytls["tls"]["server_name"], "any.example.com");
+
+        let vless = &inbounds[2];
         assert_eq!(vless["type"], "vless");
         assert_eq!(
             vless["users"][0]["uuid"],
@@ -1047,14 +1163,14 @@ mod tests {
         assert_eq!(vless["tls"]["reality"]["private_key"], "private-key");
         assert_eq!(vless["tls"]["reality"]["short_id"][0], "abcd");
 
-        let shadowsocks = &inbounds[2];
+        let shadowsocks = &inbounds[3];
         assert_eq!(shadowsocks["type"], "shadowsocks");
         assert_eq!(shadowsocks["method"], "2022-blake3-aes-128-gcm");
         assert_eq!(shadowsocks["password"], "server-secret");
         assert_eq!(shadowsocks["users"][0]["name"], "3.ss");
         assert_eq!(shadowsocks["users"][0]["password"], "user-secret");
 
-        let trojan = &inbounds[3];
+        let trojan = &inbounds[4];
         assert_eq!(trojan["type"], "trojan");
         assert_eq!(trojan["users"][0]["password"], "trojan-secret");
         assert_eq!(trojan["tls"]["enabled"], true);
